@@ -1,231 +1,110 @@
-# Hogwarts SQL Sandbox
+# Hogwarts SQL Practice
 
-A PostgreSQL practice repository built around a fictional Hogwarts database. It contains 30 SQL challenges, reference solutions, a Python-based test runner, and notes on selected PostgreSQL concepts.
+A personal PostgreSQL practice repository built around a fictional Hogwarts exam database.
 
-The exercises progress from basic queries and aggregations to window functions, CTEs, JSONB, arrays, recursive queries, materialized views, and query analysis.
-
-**Repository:** [Divya4879/hogwarts-sql-sandbox](https://github.com/Divya4879/hogwarts-sql-sandbox)
+It contains a relational dataset, 30 SQL challenges, and a separate file of reference solutions. The goal is simple: practise writing SQL, understand PostgreSQL features, and improve problem-solving through hands-on queries.
 
 ## Repository Structure
 
-| Path | Description |
+| File | Description |
 |---|---|
-| [`init/`](init/) | Database schema and seed data |
-| [`workspace/03_challenges.sql`](workspace/03_challenges.sql) | 30 SQL challenges and editable answer workspace |
-| [`solutions/04_solutions.sql`](solutions/04_solutions.sql) | Reference solutions used by the test runner |
-| [`test_runner.py`](test_runner.py) | Python-based SQL validation |
-| [`docs/architecture.md`](docs/architecture.md) | Database architecture and project design |
-| [`docs/concepts/`](docs/concepts/) | Notes on selected PostgreSQL concepts |
-| [`docker-compose.yml`](docker-compose.yml) | PostgreSQL container configuration |
-| [`requirements.txt`](requirements.txt) | Python dependencies |
+| [`init/01_schema.sql`](init/01_schema.sql) | Creates the database tables and constraints |
+| [`init/02_seed.sql`](init/02_seed.sql) | Inserts the sample Hogwarts data |
+| [`workspace/03_challenges.sql`](workspace/03_challenges.sql) | 30 SQL questions to solve |
+| [`solutions/04_solutions.sql`](solutions/04_solutions.sql) | Reference solutions |
 
-## Database Overview
+## Database Schema
 
-The sandbox uses **PostgreSQL 15** and a relational dataset containing four tables:
+The database consists of four tables:
 
-- `houses` — Hogwarts houses and their heads.
-- `students` — student details, Hogwarts year, and house.
-- `courses` — courses and their professors.
-- `exams` — exam dates, students, courses, and grades.
+- **houses** - Hogwarts houses and their heads.
+- **students** - Student details, Hogwarts year, and house.
+- **courses** - Course names and professors.
+- **exams** - Student exam records, dates, and grades.
 
-The schema defines primary keys, foreign keys, uniqueness constraints, and grade/year checks. The seed script inserts the sample records used by the exercises.
+The grade values used in the dataset are:
+
+`o++`, `o+`, `o`, `ee`, `a`, `p`, `troll`
+
+The schema includes primary keys, foreign keys, uniqueness constraints, and check constraints.
 
 ## Getting Started
 
-### Prerequisites
+You need PostgreSQL installed and a SQL client such as `psql`, pgAdmin, or DBeaver.
 
-- [Docker Desktop](https://docs.docker.com/get-started/get-docker/) or Docker Engine with the Docker Compose plugin.
-- [Python 3](https://www.python.org/downloads/).
-- Git.
-
-### 1. Clone the repository
-
-```bash
-git clone https://github.com/Divya4879/hogwarts-sql-sandbox.git
-cd hogwarts-sql-sandbox
-```
-
-### 2. Start PostgreSQL
-
-```bash
-docker compose up -d
-```
-
-This starts the `postgres-sandbox` service using the `postgres:15-alpine` image.
-
-The database uses the following local development credentials:
-
-| Setting | Value |
-|---|---|
-| Database | `hogwarts` |
-| User | `wizard` |
-| Password | `password` |
-| Host | `localhost` |
-| Host port | `5433` |
-| Container port | `5432` |
-
-The host port is mapped to the PostgreSQL container port using:
-
-```yaml
-ports:
-  - "5433:5432"
-```
-
-On the first startup with an empty PostgreSQL data directory, the SQL files in `init/` are executed in alphabetical order:
-
-1. `01_schema.sql`
-2. `02_seed.sql`
-
-Check that PostgreSQL is ready:
-
-```bash
-docker compose exec postgres-sandbox pg_isready -U wizard -d hogwarts
-```
-
-### 3. Install Python dependencies
-
-Create and activate a virtual environment.
-
-**Windows (PowerShell):**
-
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-```
-
-**Linux / macOS:**
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-Install the dependencies:
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-The project uses:
-
-- `psycopg2-binary` — PostgreSQL connectivity.
-- `pytest` — test execution.
-- `tabulate` — tabular output formatting.
-
-### 4. Run the tests
-
-```bash
-pytest -v
-```
-
-The test runner connects to the local PostgreSQL database and validates the SQL queries against the reference solutions.
-
-The default connection settings are:
-
-| Variable | Default |
-|---|---|
-| `DB_NAME` | `hogwarts` |
-| `DB_USER` | `wizard` |
-| `DB_PASSWORD` | `password` |
-| `DB_HOST` | `localhost` |
-| Port | `5433` |
-
-The database name, user, password, and host can be overridden using environment variables. The test runner currently uses port `5433` directly.
-
-## Working on the Challenges
-
-Open [`workspace/03_challenges.sql`](workspace/03_challenges.sql) and work on the queries below their corresponding question markers.
-
-The workspace currently contains SQL query drafts/answers. You can modify them as you work through the challenges.
-
-Keep the question marker format intact:
+### 1. Create a database
 
 ```sql
--- QUESTION 1: Description of the challenge
-
-SELECT ...;
+CREATE DATABASE hogwarts;
 ```
 
-The test runner uses these markers to identify individual answers. Avoid deleting or renaming them.
+### 2. Create the tables
 
-### Running Specific Tests
-
-Run the complete test suite:
+Run:
 
 ```bash
-pytest -v
+psql -d hogwarts -f init/01_schema.sql
 ```
 
-Run a specific question, for example Question 25:
+### 3. Insert the sample data
+
+Run:
 
 ```bash
-pytest -v -k query_25
+psql -d hogwarts -f init/02_seed.sql
 ```
 
-Run Question 29:
+### 4. Connect to the database
 
 ```bash
-pytest -v -k query_29
+psql -d hogwarts
 ```
 
-Run Question 30 with its execution-plan output:
+You can now start solving the challenges.
 
-```bash
-pytest -v -s -k query_30
-```
+**Note:** `01_schema.sql` contains `DROP TABLE IF EXISTS` statements. Running it again will drop and recreate the tables, deleting existing data. Run the seed file only after creating a fresh schema; running it repeatedly will attempt to insert duplicate records.
 
-### What the Tests Check
+## SQL Challenges
 
-- **Q1–Q28:** Compare query column names and result rows against the corresponding reference solutions. Row order is ignored, but duplicate rows are considered.
-- **Q29:** Execute the materialized-view definition and validate its columns and contents against independently calculated daily metrics.
-- **Q30:** Execute both `EXPLAIN ANALYZE` queries, compare their results, and display planning and execution metrics. The test does not assume that one query must always be faster.
+The repository contains 30 questions arranged progressively:
 
-The test suite also checks that both SQL files contain exactly one canonical marker for each question from 1 to 30. The reference file currently includes a few legacy exploratory markers, which the loader handles separately.
+| Level | Questions | Topics |
+|---|---|---|
+| Basic | Q1-Q6 | Filtering, sorting, joins, and basic aggregations |
+| Intermediate | Q7-Q13 | Conditional logic, subqueries, grouping, and GPA calculations |
+| Advanced | Q14-Q20 | Window functions, CTEs, JSONB, relational division, and conditional aggregation |
+| Expert | Q21-Q25 | ROLLUP, statistical functions, arrays, gap analysis, and moving averages |
+| PostgreSQL Mastery | Q26-Q30 | Data auditing, UPSERT, recursive CTEs, materialized views, and query optimization |
 
-**Important:** The tests validate your workspace queries against the reference implementations. A passing test indicates that the tested query matches the expected result for the supplied dataset; it does not necessarily establish that it is the only valid SQL solution.
+## Practice Workflow
 
-## PostgreSQL Concept Notes
+1. Open `workspace/03_challenges.sql`.
+2. Choose a question and write your query below its description.
+3. Execute it against your PostgreSQL database.
+4. Verify the output and consider edge cases.
+5. Refer to `solutions/04_solutions.sql` after attempting the question.
 
-The [`docs/concepts/`](docs/concepts/) directory contains focused notes on selected PostgreSQL topics:
+The solutions are reference implementations, not the only possible ways to solve the problems. Focus on understanding why a query works and whether it handles the requirements correctly.
 
-1. [Hierarchical Rollups and Statistical Volatility](docs/concepts/hierarchical_rollups_and_statistical_volatility.md)
-2. [Moving Averages and Window Framing](docs/concepts/moving_averages_window_framing.md)
-3. [Nested JSONB](docs/concepts/nested_jsonb_architectural_guide.md)
-4. [PostgreSQL Native Arrays](docs/concepts/postgresql_native_arrays_array_operations.md)
-5. [PostgreSQL Upserts](docs/concepts/postgresql_upserts_mutation_mechanics.md)
-6. [EXPLAIN ANALYZE](docs/concepts/query_explain_analyze.md)
-7. [Recursive CTEs and State Tracking](docs/concepts/recursive_ctes_state_tracking.md)
-8. [Time-Series Gap Analysis](docs/concepts/time_series_gap_analysis.md)
+## Topics Practised
 
-## Stopping and Resetting the Database
+- SQL filtering, joins, and aggregations
+- GROUP BY and HAVING
+- CASE expressions and subqueries
+- Common Table Expressions (CTEs)
+- Window functions and window frames
+- Ranking and cumulative calculations
+- JSONB construction and aggregation
+- Relational division using EXCEPT ALL
+- PostgreSQL arrays and containment operators
+- ROLLUP and statistical functions
+- Date generation and gap analysis
+- Moving averages
+- INSERT ... ON CONFLICT
+- Recursive CTEs
+- Materialized views
+- EXPLAIN ANALYZE and query performance
 
-Stop the running container without removing it:
+---
 
-```bash
-docker compose stop
-```
-
-Start it again:
-
-```bash
-docker compose start
-```
-
-To remove the container and its associated volumes and recreate the database from the initialization scripts:
-
-```bash
-docker compose down -v
-docker compose up -d
-```
-
-**Warning:** The reset command deletes the PostgreSQL data stored in the container's volumes. Use it only when you want a fresh database.
-
-Also note that PostgreSQL initialization scripts in `init/` run automatically only when the database data directory is first initialized. Editing those files later does not automatically re-run them against an existing database.
-
-## Tech Stack
-
-- **Database:** PostgreSQL 15
-- **Containerization:** Docker Compose
-- **Languages:** SQL, Python
-- **Testing:** pytest
-- **Database connectivity:** psycopg2
+**The purpose of this repository is to practise PostgreSQL through actual SQL problems.** The focus is on writing queries, understanding database behaviour, and building confidence with increasingly advanced SQL concepts.
