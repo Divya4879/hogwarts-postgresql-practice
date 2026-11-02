@@ -1,4 +1,4 @@
-# Hogwarts PostgreSQL Practice
+# Hogwarts SQL Practice
 
 A PostgreSQL practice repository built around a fictional Hogwarts academic database.
 
