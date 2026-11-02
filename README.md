@@ -11,20 +11,21 @@ The exercises progress from basic queries and aggregations to window functions, 
 | Path | Description |
 |---|---|
 | [`init/`](init/) | Database schema and seed data |
-| [`workspace/03_challenges.sql`](workspace/03_challenges.sql) | 30 SQL challenge prompts and workspace for answers |
-| [`solutions/04_solutions.sql`](solutions/04_solutions.sql) | Reference solutions |
-| [`test_runner.py`](test_runner.py) | Pytest-based SQL validation |
+| [`workspace/03_challenges.sql`](workspace/03_challenges.sql) | 30 SQL challenges and editable answer workspace |
+| [`solutions/04_solutions.sql`](solutions/04_solutions.sql) | Reference solutions used by the test runner |
+| [`test_runner.py`](test_runner.py) | Python-based SQL validation |
+| [`docs/architecture.md`](docs/architecture.md) | Database architecture and project design |
 | [`docs/concepts/`](docs/concepts/) | Notes on selected PostgreSQL concepts |
 | [`docker-compose.yml`](docker-compose.yml) | PostgreSQL container configuration |
 | [`requirements.txt`](requirements.txt) | Python dependencies |
 
-## Database
+## Database Overview
 
 The sandbox uses **PostgreSQL 15** and a relational dataset containing four tables:
 
 - `houses` — Hogwarts houses and their heads.
-- `students` — student details, year, and house.
-- `courses` — courses and professors.
+- `students` — student details, Hogwarts year, and house.
+- `courses` — courses and their professors.
 - `exams` — exam dates, students, courses, and grades.
 
 The schema defines primary keys, foreign keys, uniqueness constraints, and grade/year checks. The seed script inserts the sample records used by the exercises.
@@ -60,7 +61,15 @@ The database uses the following local development credentials:
 | User | `wizard` |
 | Password | `password` |
 | Host | `localhost` |
-| Port | `5432` |
+| Host port | `5433` |
+| Container port | `5432` |
+
+The host port is mapped to the PostgreSQL container port using:
+
+```yaml
+ports:
+  - "5433:5432"
+```
 
 On the first startup with an empty PostgreSQL data directory, the SQL files in `init/` are executed in alphabetical order:
 
@@ -97,27 +106,39 @@ Install the dependencies:
 python -m pip install -r requirements.txt
 ```
 
+The project uses:
+
+- `psycopg2-binary` — PostgreSQL connectivity.
+- `pytest` — test execution.
+- `tabulate` — tabular output formatting.
+
 ### 4. Run the tests
 
 ```bash
 pytest -v
 ```
 
-The test runner connects to the local PostgreSQL database and validates the SQL queries.
+The test runner connects to the local PostgreSQL database and validates the SQL queries against the reference solutions.
 
-By default, it uses the database settings listed above. You can override them with these environment variables:
+The default connection settings are:
 
-- `DB_NAME`
-- `DB_USER`
-- `DB_PASSWORD`
-- `DB_HOST`
-- `DB_PORT`
+| Variable | Default |
+|---|---|
+| `DB_NAME` | `hogwarts` |
+| `DB_USER` | `wizard` |
+| `DB_PASSWORD` | `password` |
+| `DB_HOST` | `localhost` |
+| Port | `5433` |
+
+The database name, user, password, and host can be overridden using environment variables. The test runner currently uses port `5433` directly.
 
 ## Working on the Challenges
 
-Open [`workspace/03_challenges.sql`](workspace/03_challenges.sql) and write your answers below the corresponding question markers.
+Open [`workspace/03_challenges.sql`](workspace/03_challenges.sql) and work on the queries below their corresponding question markers.
 
-Keep the marker format intact:
+The workspace currently contains SQL query drafts/answers. You can modify them as you work through the challenges.
+
+Keep the question marker format intact:
 
 ```sql
 -- QUESTION 1: Description of the challenge
@@ -125,11 +146,11 @@ Keep the marker format intact:
 SELECT ...;
 ```
 
-The test runner uses these markers to identify and compare individual answers.
+The test runner uses these markers to identify individual answers. Avoid deleting or renaming them.
 
 ### Running Specific Tests
 
-Run the full test suite:
+Run the complete test suite:
 
 ```bash
 pytest -v
@@ -159,13 +180,13 @@ pytest -v -s -k query_30
 - **Q29:** Execute the materialized-view definition and validate its columns and contents against independently calculated daily metrics.
 - **Q30:** Execute both `EXPLAIN ANALYZE` queries, compare their results, and display planning and execution metrics. The test does not assume that one query must always be faster.
 
-The test suite also checks that both SQL files contain exactly one marker for each question from 1 to 30.
+The test suite also checks that both SQL files contain exactly one canonical marker for each question from 1 to 30. The reference file currently includes a few legacy exploratory markers, which the loader handles separately.
 
-**Note:** The workspace contains the challenge descriptions. Add your SQL answers before expecting the query tests to pass.
+**Important:** The tests validate your workspace queries against the reference implementations. A passing test indicates that the tested query matches the expected result for the supplied dataset; it does not necessarily establish that it is the only valid SQL solution.
 
 ## PostgreSQL Concept Notes
 
-The [`docs/concepts/`](docs/concepts/) directory contains focused notes on selected topics:
+The [`docs/concepts/`](docs/concepts/) directory contains focused notes on selected PostgreSQL topics:
 
 1. [Hierarchical Rollups and Statistical Volatility](docs/concepts/hierarchical_rollups_and_statistical_volatility.md)
 2. [Moving Averages and Window Framing](docs/concepts/moving_averages_window_framing.md)
@@ -199,11 +220,12 @@ docker compose up -d
 
 **Warning:** The reset command deletes the PostgreSQL data stored in the container's volumes. Use it only when you want a fresh database.
 
----
+Also note that PostgreSQL initialization scripts in `init/` run automatically only when the database data directory is first initialized. Editing those files later does not automatically re-run them against an existing database.
 
 ## Tech Stack
 
 - **Database:** PostgreSQL 15
 - **Containerization:** Docker Compose
 - **Languages:** SQL, Python
-- **Testing:** pytest, psycopg2
+- **Testing:** pytest
+- **Database connectivity:** psycopg2
