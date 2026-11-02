@@ -294,5 +294,4 @@ INSERT INTO exams (student_id, course_id, exam_date, grade_result) VALUES
     (26, 1, '2004-05-24', 'troll'),
     (26, 2, '2004-05-25', 'troll'),
     (26, 3, '2004-05-26', 'troll'),
-    (26, 4, '2004-05-27', 'troll'),
-
+    (26, 4, '2004-05-27', 'troll');
