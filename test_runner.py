@@ -1,3 +1,27 @@
+
+"""
+Pytest runner for the Hogwarts PostgreSQL SQL Sandbox.
+
+Run the complete suite:
+    python test_runner.py
+
+Run one exact question:
+    python test_runner.py --question 1
+    python test_runner.py --question 29
+    python test_runner.py --question 30
+
+Database configuration can be overridden using:
+    DB_NAME
+    DB_USER
+    DB_PASSWORD
+    DB_HOST
+    DB_PORT
+
+The current solutions/04_solutions.sql contains three legacy exploratory
+question markers (Q11, Q24, Q25) before its canonical Q1-Q30 section.
+The loader recognizes and excludes those markers.
+"""
+
 import argparse
 import os
 import re
@@ -8,48 +32,85 @@ import psycopg2
 import pytest
 
 
-# =========================================================
-# Configuration
-# =========================================================
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+SOLUTION_FILE = os.path.join(
+    ROOT_DIR, "solutions", "04_solutions.sql"
+)
+
+WORKSPACE_FILE = os.path.join(
+    ROOT_DIR, "workspace", "03_challenges.sql"
+)
 
 DB_CONFIG = {
     "dbname": os.getenv("DB_NAME", "hogwarts"),
     "user": os.getenv("DB_USER", "wizard"),
     "password": os.getenv("DB_PASSWORD", "password"),
     "host": os.getenv("DB_HOST", "localhost"),
-    "port": os.getenv("DB_PORT", "5432"),
+    "port": 5433,
 }
 
-SOLUTION_FILE = "solutions/04_solutions.sql"
-WORKSPACE_FILE = "workspace/03_challenges.sql"
+QUESTION_IDS = tuple(range(1, 31))
 
-EXPECTED_QUESTION_IDS = set(range(1, 31))
+COMPARABLE_IDS = tuple(range(1, 29))
 
-# Q29 creates a materialized view.
-# Q30 uses EXPLAIN ANALYZE.
-# Both require dedicated tests.
-COMPARABLE_QUERY_IDS = tuple(range(1, 29))
+LEGACY_SOLUTION_PREFIX_IDS = {11, 24, 25}
 
-QUESTION_MARKER_PATTERN = re.compile(
+MARKER_PATTERN = re.compile(
     r"(?m)^\s*--\s*QUESTION\s+(\d+)\s*:\s*.*$",
-    flags=re.IGNORECASE,
+    re.IGNORECASE,
+)
+
+Q29_COLUMNS = (
+    "exam_date",
+    "total_exams",
+    "failed_exams",
+    "failure_rate_percent",
 )
 
 
-# =========================================================
-# SQL Parsing Utilities
-# =========================================================
+# ============================================================================
+# SQL COMMENT REMOVAL
+# ============================================================================
+
+def _is_escape_string_start(sql, index):
+    """Check whether a quote begins a PostgreSQL E'...' string."""
+
+    previous = sql[index - 1] if index > 0 else ""
+    before_previous = sql[index - 2] if index > 1 else ""
+
+    return (
+        previous in ("e", "E")
+        and (
+            not before_previous
+            or not (
+                before_previous.isalnum()
+                or before_previous in ("_", "$")
+            )
+        )
+    )
+
 
 def remove_comments(sql):
     """
-    Remove SQL comments without modifying comment-like text
-    inside strings or quoted identifiers.
+    Remove SQL line and block comments.
 
-    Handles single-quoted strings, double-quoted identifiers,
-    dollar-quoted strings, line comments, and nested block comments.
-    Newlines are preserved so separate SQL lines are not joined.
+    Preserve:
+    - Single-quoted strings
+    - Escaped strings
+    - Double-quoted identifiers
+    - Dollar-quoted strings
+    - Newlines
+
+    Nested PostgreSQL block comments are supported.
     """
-    result = []
+
+    output = []
+
     i = 0
     length = len(sql)
 
@@ -59,152 +120,213 @@ def remove_comments(sql):
     escape_string = False
 
     while i < length:
+
         char = sql[i]
         next_char = sql[i + 1] if i + 1 < length else ""
 
-        if state == "single":
-            result.append(char)
+        # ------------------------------------------------------------
+        # Single-quoted strings
+        # ------------------------------------------------------------
 
-            if escape_string and char == "\\":
-                if i + 1 < length:
-                    result.append(sql[i + 1])
-                    i += 2
-                    continue
+        if state == "single":
+
+            output.append(char)
+
+            if escape_string and char == "\\" and i + 1 < length:
+                output.append(sql[i + 1])
+                i += 2
+                continue
 
             if char == "'":
+
                 if next_char == "'":
-                    result.append(next_char)
+                    output.append(next_char)
                     i += 2
                     continue
+
                 state = "normal"
                 escape_string = False
 
             i += 1
             continue
 
+        # ------------------------------------------------------------
+        # Double-quoted identifiers
+        # ------------------------------------------------------------
+
         if state == "double":
-            result.append(char)
+
+            output.append(char)
 
             if char == '"':
+
                 if next_char == '"':
-                    result.append(next_char)
+                    output.append(next_char)
                     i += 2
                     continue
+
                 state = "normal"
 
             i += 1
             continue
+
+        # ------------------------------------------------------------
+        # Dollar-quoted strings
+        # ------------------------------------------------------------
 
         if state == "dollar":
+
             if sql.startswith(dollar_delimiter, i):
-                result.append(dollar_delimiter)
+
+                output.append(dollar_delimiter)
                 i += len(dollar_delimiter)
+
                 state = "normal"
                 dollar_delimiter = None
-                continue
 
-            result.append(char)
-            i += 1
-            continue
-
-        if state == "line_comment":
-            if char == "\n":
-                result.append("\n")
-                state = "normal"
             else:
-                result.append(" ")
+
+                output.append(char)
+                i += 1
+
+            continue
+
+        # ------------------------------------------------------------
+        # Line comments
+        # ------------------------------------------------------------
+
+        if state == "line":
+
+            if char == "\n":
+
+                output.append("\n")
+                state = "normal"
+
+            else:
+
+                output.append(" ")
+
             i += 1
             continue
 
-        if state == "block_comment":
+        # ------------------------------------------------------------
+        # Block comments
+        # ------------------------------------------------------------
+
+        if state == "block":
+
             if char == "/" and next_char == "*":
-                result.extend([" ", " "])
+
+                output.extend((" ", " "))
                 block_depth += 1
                 i += 2
                 continue
 
             if char == "*" and next_char == "/":
-                result.extend([" ", " "])
+
+                output.extend((" ", " "))
                 block_depth -= 1
                 i += 2
+
                 if block_depth == 0:
                     state = "normal"
+
                 continue
 
-            result.append("\n" if char == "\n" else " ")
+            output.append("\n" if char == "\n" else " ")
             i += 1
             continue
 
-        # Normal SQL state.
+        # ------------------------------------------------------------
+        # Normal SQL state
+        # ------------------------------------------------------------
+
         if char == "'":
-            previous = sql[i - 1] if i > 0 else ""
-            before_previous = sql[i - 2] if i > 1 else ""
 
-            # PostgreSQL E'...' escape strings.
-            escape_string = (
-                previous in ("e", "E")
-                and (
-                    not before_previous
-                    or not (
-                        before_previous.isalnum()
-                        or before_previous in ("_", "$")
-                    )
-                )
-            )
+            escape_string = _is_escape_string_start(sql, i)
 
-            result.append(char)
+            output.append(char)
             state = "single"
+
             i += 1
             continue
 
         if char == '"':
-            result.append(char)
+
+            output.append(char)
             state = "double"
+
             i += 1
             continue
 
         if char == "-" and next_char == "-":
-            result.extend([" ", " "])
-            state = "line_comment"
+
+            output.extend((" ", " "))
+            state = "line"
+
             i += 2
             continue
 
         if char == "/" and next_char == "*":
-            result.extend([" ", " "])
-            state = "block_comment"
+
+            output.extend((" ", " "))
+            state = "block"
             block_depth = 1
+
             i += 2
             continue
 
         if char == "$":
+
             match = re.match(
                 r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$",
                 sql[i:],
             )
+
             if match:
+
                 dollar_delimiter = match.group(0)
-                result.append(dollar_delimiter)
+
+                output.append(dollar_delimiter)
+
                 state = "dollar"
                 i += len(dollar_delimiter)
+
                 continue
 
-        result.append(char)
+        output.append(char)
         i += 1
 
-    return "".join(result).strip()
+    if state in {"single", "double", "dollar", "block"}:
 
+        raise ValueError(
+            f"Unterminated SQL construct: {state}"
+        )
+
+    return "".join(output).strip()
+
+
+# ============================================================================
+# SQL STATEMENT SPLITTING
+# ============================================================================
 
 def split_sql_statements(sql):
     """
-    Split SQL into individual statements using semicolons.
+    Split SQL statements at semicolons outside quoted text.
 
-    Semicolons inside strings, quoted identifiers, and dollar-quoted
-    strings are not treated as statement delimiters.
+    Supports:
+    - Single-quoted strings
+    - Escaped strings
+    - Double-quoted identifiers
+    - Dollar-quoted strings
+    - SQL comments
     """
+
     sql = remove_comments(sql)
 
     statements = []
     current = []
+
     i = 0
     length = len(sql)
 
@@ -213,23 +335,28 @@ def split_sql_statements(sql):
     escape_string = False
 
     while i < length:
+
         char = sql[i]
         next_char = sql[i + 1] if i + 1 < length else ""
 
         if state == "single":
+
             current.append(char)
 
-            if escape_string and char == "\\":
-                if i + 1 < length:
-                    current.append(sql[i + 1])
-                    i += 2
-                    continue
+            if escape_string and char == "\\" and i + 1 < length:
+
+                current.append(sql[i + 1])
+                i += 2
+                continue
 
             if char == "'":
+
                 if next_char == "'":
+
                     current.append(next_char)
                     i += 2
                     continue
+
                 state = "normal"
                 escape_string = False
 
@@ -237,312 +364,799 @@ def split_sql_statements(sql):
             continue
 
         if state == "double":
+
             current.append(char)
 
             if char == '"':
+
                 if next_char == '"':
+
                     current.append(next_char)
                     i += 2
                     continue
+
                 state = "normal"
 
             i += 1
             continue
 
         if state == "dollar":
+
             if sql.startswith(dollar_delimiter, i):
+
                 current.append(dollar_delimiter)
+
                 i += len(dollar_delimiter)
+
                 state = "normal"
                 dollar_delimiter = None
-                continue
 
-            current.append(char)
-            i += 1
+            else:
+
+                current.append(char)
+                i += 1
+
             continue
 
         if char == "'":
-            previous = sql[i - 1] if i > 0 else ""
-            before_previous = sql[i - 2] if i > 1 else ""
 
-            escape_string = (
-                previous in ("e", "E")
-                and (
-                    not before_previous
-                    or not (
-                        before_previous.isalnum()
-                        or before_previous in ("_", "$")
-                    )
-                )
-            )
+            escape_string = _is_escape_string_start(sql, i)
 
             current.append(char)
             state = "single"
+
             i += 1
             continue
 
         if char == '"':
+
             current.append(char)
             state = "double"
+
             i += 1
             continue
 
         if char == "$":
+
             match = re.match(
                 r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$",
                 sql[i:],
             )
+
             if match:
+
                 dollar_delimiter = match.group(0)
+
                 current.append(dollar_delimiter)
+
                 state = "dollar"
                 i += len(dollar_delimiter)
+
                 continue
 
         if char == ";":
+
             statement = "".join(current).strip()
+
             if statement:
                 statements.append(statement)
+
             current = []
+
             i += 1
             continue
 
         current.append(char)
         i += 1
 
+    if state in {"single", "double", "dollar"}:
+
+        raise ValueError(
+            f"Unterminated SQL construct while splitting: {state}"
+        )
+
     remaining = "".join(current).strip()
+
     if remaining:
         statements.append(remaining)
 
     return statements
 
 
-# =========================================================
-# SQL File Loading
-# =========================================================
+# ============================================================================
+# QUESTION MARKER EXTRACTION
+# ============================================================================
 
-def extract_question_markers(filepath):
-    """Return every question marker found in a SQL file."""
+def _read_sql_file(filepath):
+    """Read a SQL file and locate its question markers."""
+
     if not os.path.isfile(filepath):
-        raise FileNotFoundError(f"Could not find SQL file: {filepath}")
+
+        raise FileNotFoundError(
+            f"SQL file not found: {filepath}"
+        )
 
     with open(filepath, "r", encoding="utf-8") as file:
+
         content = file.read()
 
+    markers = list(
+        MARKER_PATTERN.finditer(content)
+    )
+
+    return content, markers
+
+
+def _canonical_markers(filepath):
+    """
+    Locate the single canonical Q1-Q30 section.
+
+    The current reference file contains older exploratory Q11, Q24 and Q25
+    blocks before the canonical section.
+
+    Those known legacy markers are excluded.
+
+    The function also permits those legacy markers to be removed later.
+    Unexpected duplicate or misplaced markers raise an error.
+    """
+
+    _, markers = _read_sql_file(filepath)
+
+    marker_ids = [
+        int(marker.group(1))
+        for marker in markers
+    ]
+
+    expected_ids = list(QUESTION_IDS)
+    block_length = len(expected_ids)
+
+    possible_starts = [
+
+        index
+
+        for index in range(
+            len(marker_ids) - block_length + 1
+        )
+
+        if marker_ids[
+            index:index + block_length
+        ] == expected_ids
+    ]
+
+    if len(possible_starts) != 1:
+
+        raise ValueError(
+            f"{filepath}: expected exactly one complete ordered "
+            f"Q1-Q30 section; found {len(possible_starts)}."
+        )
+
+    start = possible_starts[0]
+    end = start + block_length
+
+    prefix_ids = marker_ids[:start]
+    suffix_ids = marker_ids[end:]
+
+    if suffix_ids:
+
+        raise ValueError(
+            f"{filepath}: unexpected question markers after "
+            f"the canonical section: {suffix_ids}"
+        )
+
+    filename = os.path.basename(
+        os.fspath(filepath)
+    )
+
+    if filename == "04_solutions.sql":
+
+        unexpected = [
+            question_id
+            for question_id in prefix_ids
+            if question_id not in LEGACY_SOLUTION_PREFIX_IDS
+        ]
+
+        if unexpected:
+
+            raise ValueError(
+                f"{filepath}: unexpected markers before the "
+                f"canonical section: {unexpected}"
+            )
+
+        if len(prefix_ids) != len(set(prefix_ids)):
+
+            raise ValueError(
+                f"{filepath}: duplicate legacy markers detected."
+            )
+
+    elif prefix_ids:
+
+        raise ValueError(
+            f"{filepath}: unexpected markers before Q1: "
+            f"{prefix_ids}"
+        )
+
+    return markers[start:end]
+
+
+def extract_question_markers(filepath):
+    """Return canonical question numbers."""
+
     return [
-        int(match.group(1))
-        for match in QUESTION_MARKER_PATTERN.finditer(content)
+        int(marker.group(1))
+        for marker in _canonical_markers(filepath)
     ]
 
 
 def load_numbered_queries(filepath):
     """
-    Extract SQL blocks using the question marker convention.
+    Extract the SQL belonging to each canonical question.
 
-    Empty blocks are ignored, allowing the challenge file to contain
-    question descriptions without completed answers.
+    The SQL between one marker and the next belongs to that question.
     """
-    if not os.path.isfile(filepath):
-        raise FileNotFoundError(f"Could not find SQL file: {filepath}")
 
-    with open(filepath, "r", encoding="utf-8") as file:
-        content = file.read()
+    content, _ = _read_sql_file(filepath)
 
-    markers = list(QUESTION_MARKER_PATTERN.finditer(content))
+    markers = _canonical_markers(filepath)
+
     queries = {}
 
     for index, marker in enumerate(markers):
-        query_id = int(marker.group(1))
 
-        if query_id in queries:
-            raise ValueError(
-                f"Duplicate question marker: {query_id} in {filepath}"
-            )
+        question_id = int(marker.group(1))
 
         start = marker.end()
-        end = (
-            markers[index + 1].start()
-            if index + 1 < len(markers)
-            else len(content)
+
+        if index + 1 < len(markers):
+
+            end = markers[index + 1].start()
+
+        else:
+
+            end = len(content)
+
+        query_sql = remove_comments(
+            content[start:end]
         )
 
-        query_sql = remove_comments(content[start:end])
-        if query_sql:
-            queries[query_id] = query_sql
+        queries[question_id] = query_sql
 
     return queries
 
 
-# =========================================================
-# Database Fixture
-# =========================================================
+# ============================================================================
+# DATABASE FIXTURE
+# ============================================================================
 
 @pytest.fixture(scope="module")
 def db_cursor():
-    """Connect to PostgreSQL and provide a cursor."""
+    """
+    Create one PostgreSQL connection for the test module.
+
+    Individual queries are isolated using savepoints.
+    The complete test transaction is rolled back at teardown.
+    """
+
     connection = psycopg2.connect(**DB_CONFIG)
+
     connection.autocommit = False
+
     cursor = connection.cursor()
 
     try:
+
         yield cursor
+
     finally:
+
         connection.rollback()
+
         cursor.close()
+
         connection.close()
 
 
-# =========================================================
-# Result Normalization and Comparison
-# =========================================================
+# ============================================================================
+# RESULT NORMALIZATION
+# ============================================================================
 
 def normalize_value(value):
-    """Convert nested values into comparable structures."""
+    """
+    Convert nested values into comparable, hashable structures.
+
+    This supports PostgreSQL arrays and JSON/JSONB values.
+    """
+
     if isinstance(value, dict):
+
         return tuple(
             sorted(
-                (key, normalize_value(val))
-                for key, val in value.items()
+                (
+                    key,
+                    normalize_value(item),
+                )
+                for key, item in value.items()
             )
         )
 
     if isinstance(value, (list, tuple)):
-        return tuple(normalize_value(item) for item in value)
+
+        return tuple(
+            normalize_value(item)
+            for item in value
+        )
 
     return value
 
 
-def execute_and_capture(cursor, sql):
+def execute_and_capture(cursor, sql, ordered=False):
     """
-    Execute SQL and capture column names and result rows.
+    Execute SQL and capture its column names and rows.
 
-    Counter preserves duplicate rows while ignoring row order.
+    Default:
+        Counter comparison preserves duplicates but ignores row ordering.
+
+    ordered=True:
+        Preserve the original row order.
     """
+
     cursor.execute(sql)
 
     if cursor.description is None:
+
         return None, None
 
-    columns = tuple(description[0] for description in cursor.description)
-    rows = cursor.fetchall()
+    columns = tuple(
+        description[0]
+        for description in cursor.description
+    )
 
-    normalized_rows = Counter(normalize_value(row) for row in rows)
-    return columns, normalized_rows
+    rows = [
+        normalize_value(row)
+        for row in cursor.fetchall()
+    ]
+
+    if ordered:
+
+        return columns, rows
+
+    return columns, Counter(rows)
+
+
+def execute_in_savepoint(
+    cursor,
+    sql,
+    savepoint_name,
+    ordered=False,
+):
+    """
+    Execute one query inside an isolated savepoint.
+
+    Even if a query raises an exception, the transaction is restored
+    before the exception is passed back to the test.
+    """
+
+    cursor.execute(
+        f"SAVEPOINT {savepoint_name}"
+    )
+
+    try:
+
+        return execute_and_capture(
+            cursor,
+            sql,
+            ordered=ordered,
+        )
+
+    finally:
+
+        cursor.execute(
+            f"ROLLBACK TO SAVEPOINT {savepoint_name}"
+        )
+
+        cursor.execute(
+            f"RELEASE SAVEPOINT {savepoint_name}"
+        )
 
 
 def format_rows(rows):
-    """Format a normalized row Counter as readable row/count pairs."""
+    """Format query results for readable pytest failure messages."""
+
     if rows is None:
+
         return "<no result set>"
 
     if not rows:
+
         return "<no rows>"
 
-    ordered_rows = sorted(rows.items(), key=lambda item: repr(item[0]))
+    if isinstance(rows, Counter):
+
+        rows = [
+            {
+                "row": row,
+                "count": count,
+            }
+
+            for row, count in sorted(
+                rows.items(),
+                key=lambda item: repr(item[0]),
+            )
+        ]
+
     return pformat(
-        [{"row": row, "count": count} for row, count in ordered_rows],
+        rows,
         width=100,
         sort_dicts=False,
     )
 
 
-def compare_queries(cursor, user_sql, reference_sql, query_id):
-    """
-    Execute user and reference queries in separate savepoints.
+# ============================================================================
+# QUESTION COMPARISON
+# ============================================================================
 
-    Row order is ignored, but duplicate rows are preserved.
+def validate_q1_alphabetical_order(columns, rows):
     """
-    savepoint = f"question_{query_id}"
-    cursor.execute(f"SAVEPOINT {savepoint}")
+    Independently verify Q1's alphabetical last-name ordering.
+
+    The reference orders only by last_name. Therefore, students sharing
+    a last name do not have a specified relative order.
+
+    This check validates the required last-name ordering without
+    unnecessarily enforcing the reference's tie ordering.
+    """
+
+    if "student_name" not in columns:
+
+        pytest.fail(
+            "Q1: expected a student_name output column."
+        )
+
+    name_index = columns.index("student_name")
+
+    last_names = []
+
+    for row in rows:
+
+        student_name = row[name_index]
+
+        if student_name is None:
+
+            pytest.fail(
+                "Q1: student_name cannot be NULL."
+            )
+
+        last_name = str(student_name).rsplit(
+            " ", 1
+        )[-1].casefold()
+
+        last_names.append(last_name)
+
+    if last_names != sorted(last_names):
+
+        pytest.fail(
+            "Q1: students are not ordered alphabetically "
+            "by last name.\n"
+            f"Returned last names:\n{last_names}"
+        )
+
+
+def compare_queries(
+    cursor,
+    user_sql,
+    reference_sql,
+    question_id,
+):
+    """
+    Compare user and reference queries.
+
+    Q1:
+        Compare contents without relying on tie ordering.
+        Independently validate alphabetical last-name ordering.
+
+    Q2-Q28:
+        Compare duplicate-aware unordered results.
+    """
 
     try:
-        try:
-            user_columns, user_rows = execute_and_capture(cursor, user_sql)
-        except Exception as error:
-            cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-            pytest.fail(
-                f"Question {query_id}: Your query raised an error:\n{error}"
-            )
 
-        cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+        user_columns, user_rows = execute_in_savepoint(
+            cursor,
+            user_sql,
+            f"user_q{question_id}",
+            ordered=(question_id == 1),
+        )
 
-        try:
-            reference_columns, reference_rows = execute_and_capture(
-                cursor, reference_sql
-            )
-        except Exception as error:
-            cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-            pytest.fail(
-                f"Question {query_id}: The reference solution raised an "
-                f"error:\n{error}"
-            )
+    except Exception as error:
 
-        cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-
-        if user_columns is None or reference_columns is None:
-            pytest.fail(
-                f"Question {query_id}: Both queries must return a result set.\n"
-                f"Expected columns (reference): {reference_columns}\n"
-                f"Actual columns (your query):  {user_columns}\n\n"
-                f"Expected rows:\n{format_rows(reference_rows)}\n\n"
-                f"Actual rows:\n{format_rows(user_rows)}"
-            )
-
-        if user_columns != reference_columns:
-            pytest.fail(
-                f"Question {query_id}: Column names do not match.\n"
-                f"Expected columns (reference): {reference_columns}\n"
-                f"Actual columns (your query):  {user_columns}\n\n"
-                f"Expected rows:\n{format_rows(reference_rows)}\n\n"
-                f"Actual rows:\n{format_rows(user_rows)}"
-            )
-
-        if user_rows != reference_rows:
-            pytest.fail(
-                f"Question {query_id}: Result rows do not match.\n"
-                f"Expected columns: {reference_columns}\n"
-                f"Actual columns:   {user_columns}\n\n"
-                f"Expected rows (reference):\n{format_rows(reference_rows)}\n\n"
-                f"Actual rows (your query):\n{format_rows(user_rows)}"
-            )
-
-    finally:
-        cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-        cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
-
-
-# =========================================================
-# Materialized View Testing — Question 29
-# =========================================================
-
-EXPECTED_METRIC_COLUMNS = (
-    "exam_date",
-    "total_exams",
-    "failed_exams",
-    "failure_rate_percent",
-)
-
-
-def capture_materialized_view(cursor, sql, label):
-    """
-    Execute a materialized-view definition in isolation, then read
-    the actual contents of daily_exam_metrics.
-    """
-    savepoint = f"q29_{label}"
-    cursor.execute(f"SAVEPOINT {savepoint}")
+        pytest.fail(
+            f"Q{question_id}: your query raised an error:\n{error}"
+        )
 
     try:
+
+        reference_columns, reference_rows = execute_in_savepoint(
+            cursor,
+            reference_sql,
+            f"reference_q{question_id}",
+        )
+
+    except Exception as error:
+
+        pytest.fail(
+            f"Q{question_id}: reference query raised an error:\n{error}"
+        )
+
+    if user_columns is None or reference_columns is None:
+
+        pytest.fail(
+            f"Q{question_id}: both queries must return result sets.\n"
+            f"Your columns: {user_columns}\n"
+            f"Reference columns: {reference_columns}"
+        )
+
+    if user_columns != reference_columns:
+
+        pytest.fail(
+            f"Q{question_id}: column names or column order differ.\n"
+            f"Reference: {reference_columns}\n"
+            f"Your query: {user_columns}\n\n"
+            f"Reference rows:\n{format_rows(reference_rows)}\n\n"
+            f"Your rows:\n{format_rows(user_rows)}"
+        )
+
+    if question_id == 1:
+
+        user_counter = Counter(user_rows)
+
+        if user_counter != reference_rows:
+
+            pytest.fail(
+                "Q1: returned student records differ from "
+                "the reference.\n"
+                f"Reference:\n{format_rows(reference_rows)}\n\n"
+                f"Your rows:\n{format_rows(user_rows)}"
+            )
+
+        validate_q1_alphabetical_order(
+            user_columns,
+            user_rows,
+        )
+
+    elif user_rows != reference_rows:
+
+        pytest.fail(
+            f"Q{question_id}: query results differ.\n"
+            f"Reference:\n{format_rows(reference_rows)}\n\n"
+            f"Your rows:\n{format_rows(user_rows)}"
+        )
+
+
+# ============================================================================
+# INDEPENDENT VALIDATION: Q11, Q24 AND Q25
+# ============================================================================
+
+def independent_query(question_id):
+    """
+    Return independently written expected-result SQL.
+
+    These queries calculate the expected results directly from the
+    underlying exams table rather than trusting the reference solution.
+    """
+
+    if question_id == 11:
+
+        return """
+            SELECT
+
+                COUNT(*) FILTER (
+                    WHERE grade_result = 'troll'
+                ) AS total_troll_grades,
+
+                COUNT(*) AS total_exams,
+
+                ROUND(
+                    100.0 * COUNT(*) FILTER (
+                        WHERE grade_result = 'troll'
+                    ) / NULLIF(COUNT(*), 0),
+                    2
+                ) AS troll_percentage
+
+            FROM exams
+        """
+
+    if question_id == 24:
+
+        return """
+            WITH date_bounds AS (
+
+                SELECT
+                    MIN(exam_date)::date AS first_date,
+                    MAX(exam_date)::date AS last_date
+
+                FROM exams
+            ),
+
+            calendar AS (
+
+                SELECT
+                    generate_series(
+                        first_date,
+                        last_date,
+                        INTERVAL '1 day'
+                    )::date AS exam_date
+
+                FROM date_bounds
+            )
+
+            SELECT
+                calendar.exam_date
+
+            FROM calendar
+
+            LEFT JOIN exams
+                ON exams.exam_date = calendar.exam_date
+
+            GROUP BY calendar.exam_date
+
+            HAVING COUNT(exams.exam_id) = 0
+
+            ORDER BY calendar.exam_date
+        """
+
+    if question_id == 25:
+
+        return """
+            WITH date_bounds AS (
+
+                SELECT
+                    MIN(exam_date)::date AS first_date,
+                    MAX(exam_date)::date AS last_date
+
+                FROM exams
+            ),
+
+            calendar AS (
+
+                SELECT
+                    generate_series(
+                        first_date,
+                        last_date,
+                        INTERVAL '1 day'
+                    )::date AS exam_date
+
+                FROM date_bounds
+            ),
+
+            daily_counts AS (
+
+                SELECT
+                    calendar.exam_date,
+
+                    COUNT(exams.exam_id) FILTER (
+                        WHERE exams.grade_result IN ('o', 'o++')
+                    ) AS daily_count
+
+                FROM calendar
+
+                LEFT JOIN exams
+                    ON exams.exam_date = calendar.exam_date
+
+                GROUP BY calendar.exam_date
+            )
+
+            SELECT
+                exam_date,
+                daily_count,
+
+                ROUND(
+                    AVG(daily_count) OVER (
+                        ORDER BY exam_date
+                        ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+                    ),
+                    2
+                ) AS rolling_3day_avg
+
+            FROM daily_counts
+
+            ORDER BY exam_date
+        """
+
+    raise ValueError(
+        f"No independent query defined for Q{question_id}."
+    )
+
+
+def validate_independently(
+    cursor,
+    question_id,
+    user_sql,
+    reference_sql,
+):
+    """
+    Validate both the user's answer and reference answer independently.
+
+    This is particularly important for Q11, Q24 and Q25 because an
+    incorrect reference query must not be treated as ground truth.
+    """
+
+    expected_columns, expected_rows = execute_in_savepoint(
+        cursor,
+        independent_query(question_id),
+        f"expected_q{question_id}",
+    )
+
+    for label, sql in (
+        ("your answer", user_sql),
+        ("reference answer", reference_sql),
+    ):
+
+        try:
+
+            actual_columns, actual_rows = execute_in_savepoint(
+                cursor,
+                sql,
+                f"validate_{label.replace(' ', '_')}_q{question_id}",
+            )
+
+        except Exception as error:
+
+            pytest.fail(
+                f"Q{question_id}: {label} failed independent "
+                f"validation:\n{error}"
+            )
+
+        if (
+            actual_columns != expected_columns
+            or actual_rows != expected_rows
+        ):
+
+            pytest.fail(
+                f"Q{question_id}: {label} does not match the "
+                f"independently calculated expected result.\n\n"
+                f"Expected columns:\n{expected_columns}\n\n"
+                f"Actual columns:\n{actual_columns}\n\n"
+                f"Expected rows:\n{format_rows(expected_rows)}\n\n"
+                f"Actual rows:\n{format_rows(actual_rows)}"
+            )
+
+
+# ============================================================================
+# QUESTION 29: MATERIALIZED VIEW
+# ============================================================================
+
+def capture_materialized_view(
+    cursor,
+    sql,
+    label,
+):
+    """
+    Execute a materialized-view definition in an isolated savepoint.
+
+    The view is rolled back after its results have been captured.
+    """
+
+    savepoint_name = f"q29_{label}"
+
+    cursor.execute(
+        f"SAVEPOINT {savepoint_name}"
+    )
+
+    try:
+
         cursor.execute(
             "DROP MATERIALIZED VIEW IF EXISTS daily_exam_metrics"
         )
 
         statements = split_sql_statements(sql)
+
         if not statements:
-            pytest.fail(
-                f"Question 29: {label} contains no SQL statements."
+
+            raise ValueError(
+                "No SQL statements found."
             )
 
         for statement in statements:
+
             cursor.execute(statement)
 
         cursor.execute(
@@ -552,79 +1166,103 @@ def capture_materialized_view(cursor, sql, label):
                 total_exams,
                 failed_exams,
                 failure_rate_percent
+
             FROM daily_exam_metrics
+
             ORDER BY exam_date
             """
         )
 
-        columns = tuple(description[0] for description in cursor.description)
-        rows = Counter(
-            normalize_value(row) for row in cursor.fetchall()
+        columns = tuple(
+            description[0]
+            for description in cursor.description
         )
+
+        rows = Counter(
+            normalize_value(row)
+            for row in cursor.fetchall()
+        )
+
         return columns, rows
 
-    except Exception as error:
-        pytest.fail(
-            f"Question 29: {label} materialized view failed:\n{error}"
+    finally:
+
+        cursor.execute(
+            f"ROLLBACK TO SAVEPOINT {savepoint_name}"
         )
 
-    finally:
-        cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-        cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
+        cursor.execute(
+            f"RELEASE SAVEPOINT {savepoint_name}"
+        )
 
 
-def capture_expected_daily_metrics(cursor):
-    """
-    Independently calculate expected daily metrics from exams.
-    This prevents Q29 passing merely because both view definitions
-    contain the same mistake.
-    """
-    cursor.execute(
-        """
+def expected_daily_metrics(cursor):
+    """Calculate Q29's expected daily metrics directly from exams."""
+
+    sql = """
         SELECT
+
             exam_date,
+
             COUNT(*) AS total_exams,
+
             COUNT(*) FILTER (
                 WHERE grade_result IN ('p', 'troll')
             ) AS failed_exams,
+
             ROUND(
                 100.0 * COUNT(*) FILTER (
                     WHERE grade_result IN ('p', 'troll')
                 ) / NULLIF(COUNT(*), 0),
                 2
             ) AS failure_rate_percent
+
         FROM exams
+
         GROUP BY exam_date
+
         ORDER BY exam_date
-        """
+    """
+
+    return execute_in_savepoint(
+        cursor,
+        sql,
+        "q29_expected",
     )
 
-    columns = tuple(description[0] for description in cursor.description)
-    rows = Counter(normalize_value(row) for row in cursor.fetchall())
-    return columns, rows
 
-
-# =========================================================
-# EXPLAIN ANALYZE Testing — Question 30
-# =========================================================
+# ============================================================================
+# QUESTION 30: EXPLAIN ANALYZE
+# ============================================================================
 
 def extract_explain_statements(sql):
-    """Extract EXPLAIN statements from a SQL question block."""
-    statements = split_sql_statements(sql)
+    """Extract EXPLAIN statements from a question block."""
+
     return [
+
         statement
-        for statement in statements
-        if re.match(r"^\s*EXPLAIN\b", statement, flags=re.IGNORECASE)
+
+        for statement in split_sql_statements(sql)
+
+        if re.match(
+            r"^\s*EXPLAIN\b",
+            statement,
+            re.IGNORECASE,
+        )
     ]
 
 
 def remove_explain_prefix(statement):
     """
-    Remove EXPLAIN ANALYZE so the underlying SELECT can be executed.
+    Remove EXPLAIN ANALYZE from a statement.
 
-    Supports EXPLAIN ANALYZE SELECT ... and
-    EXPLAIN (ANALYZE, BUFFERS) SELECT ...
+    Supports:
+
+        EXPLAIN ANALYZE SELECT ...
+
+        EXPLAIN (ANALYZE, BUFFERS) SELECT ...
     """
+
     pattern = re.compile(
         r"""
         ^\s*
@@ -637,465 +1275,679 @@ def remove_explain_prefix(statement):
         )
         \s*
         """,
-        flags=re.IGNORECASE | re.VERBOSE,
+        re.IGNORECASE | re.VERBOSE,
     )
 
     match = pattern.match(statement)
+
     if not match:
+
         raise ValueError(
-            "Question 30 requires EXPLAIN ANALYZE statements."
+            "Q30 requires EXPLAIN ANALYZE statements."
         )
 
-    query = statement[match.end():].strip()
+    query = statement[
+        match.end():
+    ].strip()
 
-    if not re.match(r"^(SELECT|WITH)\b", query, flags=re.IGNORECASE):
+    if not re.match(
+        r"^(SELECT|WITH)\b",
+        query,
+        re.IGNORECASE,
+    ):
+
         raise ValueError(
-            "Question 30 should use SELECT queries inside EXPLAIN ANALYZE."
+            "Q30 EXPLAIN ANALYZE must wrap a SELECT or WITH query."
         )
 
     return query
 
 
-def extract_plan_metrics(plan_text):
-    """
-    Extract planning time, execution time, estimated total cost,
-    and root actual time from EXPLAIN ANALYZE output.
-    """
-    execution_match = re.search(
-        r"Execution Time:\s*([\d.]+)\s*ms",
-        plan_text,
-        flags=re.IGNORECASE,
-    )
-    planning_match = re.search(
-        r"Planning Time:\s*([\d.]+)\s*ms",
-        plan_text,
-        flags=re.IGNORECASE,
-    )
-    cost_match = re.search(
-        r"cost=[\d.]+\.\.([\d.]+)",
-        plan_text,
-        flags=re.IGNORECASE,
-    )
-    actual_match = re.search(
-        r"actual time=[\d.]+\.\.([\d.]+)",
-        plan_text,
-        flags=re.IGNORECASE,
-    )
+def extract_plan_metrics(plan):
+    """Extract PostgreSQL execution-plan metrics."""
 
-    if not execution_match or not planning_match:
-        raise ValueError(
-            "The EXPLAIN ANALYZE output is missing planning or execution time."
+    patterns = {
+
+        "execution_time_ms":
+            r"Execution Time:\s*([\d.]+)\s*ms",
+
+        "planning_time_ms":
+            r"Planning Time:\s*([\d.]+)\s*ms",
+
+        "estimated_total_cost":
+            r"cost=[\d.]+\.\.([\d.]+)",
+
+        "root_actual_time_ms":
+            r"actual time=[\d.]+\.\.([\d.]+)",
+    }
+
+    matches = {
+
+        key: re.search(
+            pattern,
+            plan,
+            re.IGNORECASE,
         )
 
-    if not actual_match:
-        raise ValueError(
-            "The EXPLAIN ANALYZE output does not contain actual execution details."
-        )
+        for key, pattern in patterns.items()
+    }
+
+    required_metrics = (
+        "execution_time_ms",
+        "planning_time_ms",
+        "root_actual_time_ms",
+    )
+
+    for metric in required_metrics:
+
+        if not matches[metric]:
+
+            raise ValueError(
+                f"EXPLAIN ANALYZE output is missing {metric}."
+            )
 
     return {
-        "execution_time_ms": float(execution_match.group(1)),
-        "planning_time_ms": float(planning_match.group(1)),
-        "estimated_total_cost": (
-            float(cost_match.group(1)) if cost_match else None
-        ),
-        "root_actual_time_ms": float(actual_match.group(1)),
+
+        key: (
+            float(match.group(1))
+            if match
+            else None
+        )
+
+        for key, match in matches.items()
     }
 
 
-def execute_and_capture_plan(cursor, explain_statement, label):
-    """
-    Execute one EXPLAIN ANALYZE statement and capture its plan,
-    metrics, and the underlying SELECT result, inside a savepoint.
-    """
-    savepoint = f"q30_{label}"
-    cursor.execute(f"SAVEPOINT {savepoint}")
+def capture_plan(
+    cursor,
+    statement,
+    label,
+):
+    """Execute EXPLAIN ANALYZE and capture its plan and query results."""
+
+    savepoint_name = f"q30_{label}"
+
+    cursor.execute(
+        f"SAVEPOINT {savepoint_name}"
+    )
 
     try:
-        cursor.execute(explain_statement)
-        plan_rows = cursor.fetchall()
-        plan_text = "\n".join(str(row[0]) for row in plan_rows)
 
-        if not plan_text.strip():
+        cursor.execute(statement)
+
+        plan_rows = cursor.fetchall()
+
+        plan = "\n".join(
+            str(row[0])
+            for row in plan_rows
+        )
+
+        if not plan.strip():
+
             raise ValueError(
-                "EXPLAIN ANALYZE returned an empty execution plan."
+                "EXPLAIN ANALYZE returned an empty plan."
             )
 
-        metrics = extract_plan_metrics(plan_text)
-        underlying_query = remove_explain_prefix(explain_statement)
-        columns, rows = execute_and_capture(cursor, underlying_query)
+        metrics = extract_plan_metrics(plan)
+
+        underlying_query = remove_explain_prefix(
+            statement
+        )
+
+        columns, rows = execute_and_capture(
+            cursor,
+            underlying_query,
+        )
 
         if columns is None:
+
             raise ValueError(
-                "The underlying Q30 query did not return a result set."
+                "The underlying query returned no result set."
             )
 
         return {
-            "plan": plan_text,
+
+            "plan": plan,
+
             "metrics": metrics,
+
             "columns": columns,
+
             "rows": rows,
         }
 
-    except Exception as error:
-        pytest.fail(
-            f"Question 30: {label} execution plan failed:\n{error}"
+    finally:
+
+        cursor.execute(
+            f"ROLLBACK TO SAVEPOINT {savepoint_name}"
         )
 
-    finally:
-        cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-        cursor.execute(f"RELEASE SAVEPOINT {savepoint}")
+        cursor.execute(
+            f"RELEASE SAVEPOINT {savepoint_name}"
+        )
 
 
-# =========================================================
-# Load Both SQL Files Once
-# =========================================================
+def expected_q30_results(cursor):
+    """
+    Independently calculate the expected student GPA results.
+
+    The mapping follows the repository's Q13/Q30 grade scale.
+    """
+
+    sql = """
+        SELECT
+
+            s.first_name || ' ' || s.last_name AS student_name,
+
+            ROUND(
+                AVG(
+                    CASE
+                        WHEN e.grade_result = 'o++' THEN 6.0
+                        WHEN e.grade_result = 'o+' THEN 5.0
+                        WHEN e.grade_result = 'o' THEN 4.0
+                        WHEN e.grade_result = 'ee' THEN 3.0
+                        WHEN e.grade_result = 'a' THEN 2.0
+                        WHEN e.grade_result = 'p' THEN 1.0
+                        ELSE 0.0
+                    END
+                ),
+                2
+            ) AS avg_gpa
+
+        FROM students s
+
+        JOIN exams e
+            ON e.student_id = s.student_id
+
+        GROUP BY
+            s.student_id,
+            s.first_name,
+            s.last_name
+    """
+
+    return execute_in_savepoint(
+        cursor,
+        sql,
+        "q30_expected",
+    )
+
+
+# ============================================================================
+# PYTEST FIXTURES
+# ============================================================================
 
 @pytest.fixture(scope="module")
 def query_files():
-    user_queries = load_numbered_queries(WORKSPACE_FILE)
-    reference_queries = load_numbered_queries(SOLUTION_FILE)
+    """Load canonical workspace and reference SQL blocks."""
+
+    user_queries = load_numbered_queries(
+        WORKSPACE_FILE
+    )
+
+    reference_queries = load_numbered_queries(
+        SOLUTION_FILE
+    )
+
     return user_queries, reference_queries
 
 
-# =========================================================
-# Marker Integrity Tests
-# =========================================================
+# ============================================================================
+# TESTS: FILE STRUCTURE AND DATABASE
+# ============================================================================
 
 @pytest.mark.parametrize(
     "filepath",
-    [WORKSPACE_FILE, SOLUTION_FILE],
+    [
+        WORKSPACE_FILE,
+        SOLUTION_FILE,
+    ],
 )
 def test_question_marker_integrity(filepath):
-    """
-    Verify that each SQL file contains exactly one marker
-    for every question from 1 through 30.
-    """
-    marker_ids = extract_question_markers(filepath)
-    marker_counts = Counter(marker_ids)
+    """Verify that the canonical SQL section contains Q1-Q30 exactly once."""
 
-    duplicates = sorted(
-        question_id
-        for question_id, count in marker_counts.items()
-        if count > 1
-    )
-    actual_ids = set(marker_ids)
-    missing = sorted(EXPECTED_QUESTION_IDS - actual_ids)
-    unexpected = sorted(actual_ids - EXPECTED_QUESTION_IDS)
-
-    assert not duplicates, (
-        f"{filepath}: Duplicate question markers: {duplicates}"
-    )
-    assert not missing, f"{filepath}: Missing question markers: {missing}"
-    assert not unexpected, (
-        f"{filepath}: Unexpected question markers: {unexpected}"
-    )
-    assert len(marker_ids) == 30, (
-        f"{filepath}: Expected exactly 30 markers, found {len(marker_ids)}."
+    marker_ids = extract_question_markers(
+        filepath
     )
 
+    assert marker_ids == list(QUESTION_IDS), (
+        f"{filepath}: expected canonical markers Q1-Q30 "
+        f"in order; found {marker_ids}."
+    )
 
-# =========================================================
-# Database Connection Test
-# =========================================================
 
 def test_sandbox_connection(db_cursor):
-    """Verify that the database and seed data are available."""
-    db_cursor.execute("SELECT COUNT(*) FROM students")
+    """Verify PostgreSQL connectivity and the presence of seeded students."""
+
+    db_cursor.execute(
+        "SELECT COUNT(*) FROM students"
+    )
+
     student_count = db_cursor.fetchone()[0]
 
     assert student_count > 0, (
-        "The database has no students. "
-        "Check whether the schema and seed scripts have run."
+        "No students found in the database. "
+        "Check init/01_schema.sql and init/02_seed.sql."
     )
 
 
-# =========================================================
-# Q1–Q28: Compare Answers Against Reference Solutions
-# =========================================================
+# ============================================================================
+# TESTS: QUESTIONS 1-28
+# ============================================================================
 
 @pytest.mark.parametrize(
-    "query_id",
+    "question_id",
     [
         pytest.param(
-            query_id,
-            id=f"query_{query_id}",
-            marks=pytest.mark.question(query_id),
+            question_id,
+            id=f"query_{question_id}",
         )
-        for query_id in COMPARABLE_QUERY_IDS
+
+        for question_id in COMPARABLE_IDS
     ],
 )
-def test_query_match_solution(db_cursor, query_files, query_id):
+def test_query_match_solution(
+    db_cursor,
+    query_files,
+    question_id,
+):
+    """
+    Compare Q1-Q28.
+
+    Q11, Q24 and Q25 also receive independent correctness validation.
+    """
+
     user_queries, reference_queries = query_files
 
-    assert query_id in user_queries, (
-        f"Question {query_id}: No SQL answer found in {WORKSPACE_FILE}. "
-        "The challenge description alone is not an answer."
-    )
-    assert query_id in reference_queries, (
-        f"Question {query_id}: No reference answer found in {SOLUTION_FILE}."
-    )
+    user_sql = user_queries.get(question_id)
+
+    reference_sql = reference_queries.get(question_id)
+
+    if not user_sql:
+
+        pytest.fail(
+            f"Q{question_id}: no SQL answer found in "
+            f"{WORKSPACE_FILE}."
+        )
+
+    if not reference_sql:
+
+        pytest.fail(
+            f"Q{question_id}: reference solution missing from "
+            f"{SOLUTION_FILE}."
+        )
+
+    if question_id in {11, 24, 25}:
+
+        validate_independently(
+            db_cursor,
+            question_id,
+            user_sql,
+            reference_sql,
+        )
 
     compare_queries(
-        cursor=db_cursor,
-        user_sql=user_queries[query_id],
-        reference_sql=reference_queries[query_id],
-        query_id=query_id,
+        db_cursor,
+        user_sql,
+        reference_sql,
+        question_id,
     )
 
 
-# =========================================================
-# Q29: Validate Actual Materialized View Contents
-# =========================================================
+# ============================================================================
+# TEST: QUESTION 29
+# ============================================================================
 
-@pytest.mark.question(29)
-def test_query_29_materialized_view_contents(db_cursor, query_files):
+def test_query_29_materialized_view_contents(
+    db_cursor,
+    query_files,
+):
+    """
+    Validate the user's Q29 materialized view.
+
+    Expected metrics are independently calculated from exams.
+    """
+
     user_queries, reference_queries = query_files
 
-    assert 29 in user_queries, (
-        f"Question 29: Add your materialized-view solution to {WORKSPACE_FILE}."
-    )
-    assert 29 in reference_queries, (
-        "Question 29: Reference solution is missing."
+    user_sql = user_queries.get(29)
+
+    reference_sql = reference_queries.get(29)
+
+    if not user_sql:
+
+        pytest.fail(
+            f"Q29: add your materialized-view SQL to "
+            f"{WORKSPACE_FILE}."
+        )
+
+    if not reference_sql:
+
+        pytest.fail(
+            "Q29: reference materialized view is missing."
+        )
+
+    try:
+
+        user_columns, user_rows = capture_materialized_view(
+            db_cursor,
+            user_sql,
+            "user",
+        )
+
+    except Exception as error:
+
+        pytest.fail(
+            f"Q29: your materialized view failed:\n{error}"
+        )
+
+    try:
+
+        reference_columns, reference_rows = capture_materialized_view(
+            db_cursor,
+            reference_sql,
+            "reference",
+        )
+
+    except Exception as error:
+
+        pytest.fail(
+            f"Q29: reference materialized view failed:\n{error}"
+        )
+
+    expected_columns, expected_rows = expected_daily_metrics(
+        db_cursor
     )
 
-    user_columns, user_rows = capture_materialized_view(
-        db_cursor, user_queries[29], "user"
+    assert expected_columns == Q29_COLUMNS, (
+        f"Q29: independent query returned unexpected columns: "
+        f"{expected_columns}"
     )
-    reference_columns, reference_rows = capture_materialized_view(
-        db_cursor, reference_queries[29], "reference"
-    )
-    expected_columns, expected_rows = capture_expected_daily_metrics(db_cursor)
 
-    assert expected_columns == EXPECTED_METRIC_COLUMNS, (
-        "Question 29: The independent metric query returned unexpected columns. "
-        f"Expected: {EXPECTED_METRIC_COLUMNS}; actual: {expected_columns}"
+    assert user_columns == Q29_COLUMNS, (
+        f"Q29: your materialized view columns are incorrect. "
+        f"Expected {Q29_COLUMNS}; received {user_columns}."
     )
-    assert user_columns == EXPECTED_METRIC_COLUMNS, (
-        "Question 29: Your materialized view has incorrect columns.\n"
-        f"Expected: {EXPECTED_METRIC_COLUMNS}\n"
-        f"Actual:   {user_columns}"
+
+    assert reference_columns == Q29_COLUMNS, (
+        "Q29: reference materialized view has incorrect columns."
     )
-    assert reference_columns == EXPECTED_METRIC_COLUMNS, (
-        "Question 29: The reference materialized view has incorrect columns."
-    )
-    assert user_columns == reference_columns, (
-        "Question 29: Your materialized-view columns do not match the reference."
-    )
+
     assert user_rows == expected_rows, (
-        "Question 29: Your materialized view contains incorrect data.\n"
-        f"Expected rows:\n{format_rows(expected_rows)}\n\n"
-        f"Actual rows:\n{format_rows(user_rows)}"
+        "Q29: your materialized view does not match "
+        "the independently calculated metrics.\n"
+        f"Expected:\n{format_rows(expected_rows)}\n\n"
+        f"Actual:\n{format_rows(user_rows)}"
     )
+
     assert reference_rows == expected_rows, (
-        "Question 29: The reference materialized view does not match "
-        "the independently calculated daily metrics."
+        "Q29: reference materialized view does not match "
+        "the independently calculated metrics."
     )
 
 
-# =========================================================
-# Q30: Execute and Compare Both EXPLAIN ANALYZE Plans
-# =========================================================
+# ============================================================================
+# TEST: QUESTION 30
+# ============================================================================
 
-@pytest.mark.question(30)
-def test_query_30_explain_analyze_plans(db_cursor, query_files):
+def test_query_30_explain_analyze_plans(
+    db_cursor,
+    query_files,
+):
+    """
+    Validate both Q30 approaches.
+
+    Checks:
+    - Exactly two EXPLAIN ANALYZE statements.
+    - Both approaches execute successfully.
+    - Both approaches return equivalent results.
+    - User results match reference results.
+    - Results match an independent GPA calculation.
+
+    No assertion requires one query to be faster. Execution time and
+    planner cost depend on database size, indexes, caching, statistics,
+    PostgreSQL version and hardware.
+    """
+
     user_queries, reference_queries = query_files
 
-    assert 30 in user_queries, (
-        f"Question 30: Add both EXPLAIN ANALYZE queries to {WORKSPACE_FILE}."
-    )
-    assert 30 in reference_queries, (
-        "Question 30: Reference solution is missing."
+    user_sql = user_queries.get(30)
+
+    reference_sql = reference_queries.get(30)
+
+    if not user_sql:
+
+        pytest.fail(
+            f"Q30: add both EXPLAIN ANALYZE queries to "
+            f"{WORKSPACE_FILE}."
+        )
+
+    if not reference_sql:
+
+        pytest.fail(
+            "Q30: reference solution is missing."
+        )
+
+    user_statements = extract_explain_statements(
+        user_sql
     )
 
-    user_statements = extract_explain_statements(user_queries[30])
-    reference_statements = extract_explain_statements(reference_queries[30])
+    reference_statements = extract_explain_statements(
+        reference_sql
+    )
 
     assert len(user_statements) == 2, (
-        "Question 30: Your answer must contain exactly two EXPLAIN ANALYZE "
-        f"statements: one for each approach. Found {len(user_statements)}."
+        "Q30: expected exactly two user EXPLAIN ANALYZE "
+        f"statements; found {len(user_statements)}."
     )
+
     assert len(reference_statements) == 2, (
-        "Question 30: The reference must contain exactly two "
-        "EXPLAIN ANALYZE statements."
+        "Q30: expected exactly two reference EXPLAIN ANALYZE "
+        f"statements; found {len(reference_statements)}."
     )
 
     user_plans = [
-        execute_and_capture_plan(
-            db_cursor, statement, f"user_plan_{index + 1}"
+
+        capture_plan(
+            db_cursor,
+            statement,
+            f"user_{index}",
         )
-        for index, statement in enumerate(user_statements)
+
+        for index, statement in enumerate(
+            user_statements,
+            start=1,
+        )
     ]
+
     reference_plans = [
-        execute_and_capture_plan(
-            db_cursor, statement, f"reference_plan_{index + 1}"
+
+        capture_plan(
+            db_cursor,
+            statement,
+            f"reference_{index}",
         )
-        for index, statement in enumerate(reference_statements)
+
+        for index, statement in enumerate(
+            reference_statements,
+            start=1,
+        )
     ]
 
-    # Both user queries must return equivalent results.
-    first_plan, second_plan = user_plans
-    assert first_plan["columns"] == second_plan["columns"], (
-        "Question 30: The two approaches return different column names.\n"
-        f"First:  {first_plan['columns']}\n"
-        f"Second: {second_plan['columns']}"
-    )
-    assert first_plan["rows"] == second_plan["rows"], (
-        "Question 30: The correlated and optimized queries do not "
-        "return equivalent results.\n"
-        f"First query columns:  {first_plan['columns']}\n"
-        f"Second query columns: {second_plan['columns']}\n\n"
-        f"First query rows:\n{format_rows(first_plan['rows'])}\n\n"
-        f"Second query rows:\n{format_rows(second_plan['rows'])}"
-    )
+    user_first, user_second = user_plans
 
-    # Both reference queries must also be equivalent.
     reference_first, reference_second = reference_plans
+
+    # ------------------------------------------------------------
+    # User approaches must agree.
+    # ------------------------------------------------------------
+
+    assert user_first["columns"] == user_second["columns"], (
+        "Q30: your two approaches return different columns."
+    )
+
+    assert user_first["rows"] == user_second["rows"], (
+        "Q30: your correlated and JOIN approaches return "
+        "different results."
+    )
+
+    # ------------------------------------------------------------
+    # Reference approaches must agree.
+    # ------------------------------------------------------------
+
     assert reference_first["columns"] == reference_second["columns"], (
-        "Question 30: The two reference approaches return different columns."
+        "Q30: reference approaches return different columns."
     )
+
     assert reference_first["rows"] == reference_second["rows"], (
-        "Question 30: The two reference approaches do not return equivalent "
-        "results.\n"
-        f"First reference rows:\n{format_rows(reference_first['rows'])}\n\n"
-        f"Second reference rows:\n{format_rows(reference_second['rows'])}"
+        "Q30: reference approaches return different results."
     )
 
-    # Compare user results with reference results.
-    assert first_plan["columns"] == reference_first["columns"], (
-        "Question 30: Your query columns do not match the reference."
-    )
-    assert first_plan["rows"] == reference_first["rows"], (
-        "Question 30: Your query results do not match the reference.\n"
-        f"Expected columns (reference): {reference_first['columns']}\n"
-        f"Actual columns (your query):  {first_plan['columns']}\n\n"
-        f"Expected rows (reference):\n{format_rows(reference_first['rows'])}\n\n"
-        f"Actual rows (your query):\n{format_rows(first_plan['rows'])}"
+    # ------------------------------------------------------------
+    # User and reference must agree.
+    # ------------------------------------------------------------
+
+    assert user_first["columns"] == reference_first["columns"], (
+        "Q30: your output columns differ from the reference."
     )
 
-    # Display plan metrics for manual performance review.
-    print("\nQuestion 30 — EXPLAIN ANALYZE comparison")
+    assert user_first["rows"] == reference_first["rows"], (
+        "Q30: your output rows differ from the reference."
+    )
 
-    for index, result in enumerate(user_plans, start=1):
+    # ------------------------------------------------------------
+    # Independent GPA validation.
+    # ------------------------------------------------------------
+
+    expected_columns, expected_rows = expected_q30_results(
+        db_cursor
+    )
+
+    assert user_first["columns"] == expected_columns, (
+        "Q30: output columns differ from the independent GPA calculation."
+    )
+
+    assert user_first["rows"] == expected_rows, (
+        "Q30: output rows differ from the independent GPA calculation."
+    )
+
+    # ------------------------------------------------------------
+    # Display execution-plan metrics.
+    # ------------------------------------------------------------
+
+    print(
+        "\nQ30 — EXPLAIN ANALYZE comparison"
+    )
+
+    for index, result in enumerate(
+        user_plans,
+        start=1,
+    ):
+
         metrics = result["metrics"]
-        print(f"\nYour plan {index}:")
-        print(f"  Planning time:       {metrics['planning_time_ms']} ms")
-        print(f"  Execution time:      {metrics['execution_time_ms']} ms")
-        print(f"  Estimated total cost: {metrics['estimated_total_cost']}")
-        print(f"  Root actual time:    {metrics['root_actual_time_ms']} ms")
 
-    # Do not assert that the second query must be faster. Execution times
-    # and planner costs depend on data size, indexes, caching, and hardware.
+        print(
+            f"\nYour plan {index}:"
+        )
+
+        print(
+            f"  Planning time:        "
+            f"{metrics['planning_time_ms']} ms"
+        )
+
+        print(
+            f"  Execution time:       "
+            f"{metrics['execution_time_ms']} ms"
+        )
+
+        print(
+            f"  Estimated total cost: "
+            f"{metrics['estimated_total_cost']}"
+        )
+
+        print(
+            f"  Root actual time:     "
+            f"{metrics['root_actual_time_ms']} ms"
+        )
 
 
-# =========================================================
-# Exact pytest selection and command-line interface
-# =========================================================
-
-def pytest_configure(config):
-    """Register the marker used to identify individual questions."""
-    config.addinivalue_line(
-        "markers",
-        "question(question_id): identifies the SQL question being tested",
-    )
-
-
-@pytest.hookimpl(tryfirst=True)
-def pytest_collection_modifyitems(config, items):
-    """
-    Make a simple '-k query_N' expression select exactly question N.
-
-    Pytest normally uses substring matching, so '-k query_1' also matches
-    query_10 through query_19. This hook narrows simple query_N expressions
-    before pytest's normal keyword filtering. Other -k expressions retain
-    pytest's standard behavior.
-    """
-    keyword_expression = (config.option.keyword or "").strip()
-    match = re.fullmatch(
-        r"query_(\d+)",
-        keyword_expression,
-        flags=re.IGNORECASE,
-    )
-
-    if not match:
-        return
-
-    requested_id = int(match.group(1))
-    selected = []
-    deselected = []
-
-    for item in items:
-        marker = item.get_closest_marker("question")
-        question_id = marker.args[0] if marker and marker.args else None
-
-        if question_id == requested_id:
-            selected.append(item)
-        else:
-            deselected.append(item)
-
-    if deselected:
-        config.hook.pytest_deselected(items=deselected)
-
-    items[:] = selected
-
+# ============================================================================
+# EXACT COMMAND-LINE QUESTION SELECTION
+# ============================================================================
 
 def question_node_id(question_id):
-    """Return the exact pytest node ID for a question."""
-    if question_id in COMPARABLE_QUERY_IDS:
+    """
+    Return the exact pytest node ID for one question.
+
+    This avoids pytest -k substring matching.
+    """
+
+    filepath = os.path.abspath(__file__)
+
+    if question_id in COMPARABLE_IDS:
+
         return (
-            f"{os.path.abspath(__file__)}::"
+            f"{filepath}::"
             f"test_query_match_solution[query_{question_id}]"
         )
 
     if question_id == 29:
+
         return (
-            f"{os.path.abspath(__file__)}::"
+            f"{filepath}::"
             "test_query_29_materialized_view_contents"
         )
 
     if question_id == 30:
+
         return (
-            f"{os.path.abspath(__file__)}::"
+            f"{filepath}::"
             "test_query_30_explain_analyze_plans"
         )
 
-    raise ValueError(f"Unsupported question number: {question_id}")
+    raise ValueError(
+        f"Unsupported question number: {question_id}"
+    )
 
 
 def main(argv=None):
-    """Run the full test suite or one selected question."""
-    parser = argparse.ArgumentParser(
-        description="Run SQL challenge tests for Hogwarts SQL Sandbox."
-    )
-    selection = parser.add_mutually_exclusive_group()
+    """Run all tests or one exact question."""
 
-    selection.add_argument(
+    parser = argparse.ArgumentParser(
+        description="Run Hogwarts PostgreSQL SQL Sandbox tests."
+    )
+
+    parser.add_argument(
         "--question",
         type=int,
         choices=range(1, 31),
         metavar="N",
-        help="run only question N (1-30)",
-    )
-    selection.add_argument(
-        "--all",
-        action="store_true",
-        help="run the complete test suite",
+        help="run exactly one question (1-30)",
     )
 
     args = parser.parse_args(argv)
+
     pytest_args = ["-v"]
 
     if args.question is not None:
-        pytest_args.append(question_node_id(args.question))
-    else:
-        # --all, or no CLI option, runs the complete suite.
-        pytest_args.append(os.path.abspath(__file__))
 
-    return int(pytest.main(pytest_args))
+        pytest_args.append(
+            question_node_id(args.question)
+        )
+
+        if args.question == 30:
+
+            pytest_args.append("-s")
+
+    else:
+
+        pytest_args.append(
+            os.path.abspath(__file__)
+        )
+
+    return int(
+        pytest.main(pytest_args)
+    )
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-    # The test deliberately does not assert that the second
-    # query must be faster. Execution times and planner costs
-    # depend on database size, indexes, caching and hardware.
